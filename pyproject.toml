@@ -1,0 +1,20 @@
+[build-system]
+requires = ["uv_build>=0.7.19,<0.8.0"]
+build-backend = "uv_build"
+
+[project]
+name = "haberlea-tidal"
+version = "0.1.0"
+description = "TIDAL module for Haberlea"
+requires-python = ">=3.11"
+dependencies = [
+    "aiofiles>=25.1.0",
+    "aiohttp>=3.13.2",
+    "av>=16.0.1",
+    "beautifulsoup4[lxml]>=4.14.3",
+    "msgspec>=0.20.0",
+    "rich>=14.2.0",
+]
+
+[project.entry-points."haberlea.modules"]
+tidal = "haberlea_tidal:module_information"
