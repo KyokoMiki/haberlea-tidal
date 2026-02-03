@@ -4,15 +4,15 @@ This module provides the main interface for downloading music from TIDAL,
 supporting various audio formats including FLAC, MQA, Dolby Atmos, and Sony 360RA.
 """
 
-import asyncio
 import base64
-import io
 import re
 from typing import Any
 
-import aiofiles
+import anyio
 import av
 import msgspec
+from anyio import open_file
+from anyio.to_thread import run_sync
 from bs4 import BeautifulSoup
 from rich import print
 
@@ -42,7 +42,11 @@ from haberlea.utils.models import (
     TrackInfo,
 )
 from haberlea.utils.progress import advance, get_current_task, reset
-from haberlea.utils.utils import create_aiohttp_session, download_file, sanitise_name
+from haberlea.utils.tempfile_manager import TempFileManager
+from haberlea.utils.utils import (
+    create_aiohttp_session,
+    sanitise_name,
+)
 
 from .tidal_api import (
     SessionType,
@@ -129,6 +133,7 @@ class ModuleInterface(ModuleBase):
         self.sessions: dict[str, TidalTvSession | TidalMobileSession] = {}
         self.api: TidalApi | None = None
         self.album_cache: dict[str, dict[str, Any]] = {}
+        self.temp_manager = TempFileManager()
 
         # Try to restore saved sessions
         self._restore_sessions()
@@ -209,7 +214,7 @@ class ModuleInterface(ModuleBase):
                         print("Waiting for authorization...")
                         # Poll for completion
                         while not await tv_session.check_auth(device_code):
-                            await asyncio.sleep(2)
+                            await anyio.sleep(2)
                         print("Authorization successful!")
                 else:
                     # Use refresh token from TV session if available
@@ -1146,70 +1151,52 @@ class ModuleInterface(ModuleBase):
         file_url = data.get("file_url") or url
         audio_track: AudioTrack | None = data.get("audio_track")
 
-        # Simple URL download (MHA1, EC-3, MQA, etc.)
-        if file_url and not audio_track:
-            await download_file(file_url, target_path)
-            return TrackDownloadInfo(download_type=DownloadEnum.DIRECT)
-
         # MPEG-DASH segmented download
         if audio_track:
-            temp_segments: list[bytes] = []
-
             # Calculate total size for progress reporting
             total_segments = len(audio_track.urls)
             task_id = get_current_task()
             if task_id:
                 reset(task_id)
 
-            # Download all segments
-            session = create_aiohttp_session()
-            try:
-                for segment_url in audio_track.urls:
-                    async with session.get(segment_url) as response:
-                        response.raise_for_status()
-                        segment_data = await response.read()
-                        temp_segments.append(segment_data)
-                        # Report progress based on segment count
-                        if task_id:
-                            await advance(task_id, 1, total_segments)
-            finally:
-                await session.close()
+            # Use temporary file to store merged segments
+            async with self.temp_manager.file(suffix=".mp4") as temp_mp4_path:
+                # Download all segments and write directly to temp file
+                session = create_aiohttp_session()
+                try:
+                    async with await open_file(temp_mp4_path, "wb") as temp_file:
+                        for segment_url in audio_track.urls:
+                            async with session.get(segment_url) as response:
+                                response.raise_for_status()
+                                segment_data = await response.read()
+                                await temp_file.write(segment_data)
+                                # Report progress based on segment count
+                                if task_id:
+                                    await advance(task_id, 1, total_segments)
+                finally:
+                    await session.close()
 
-            # Merge segments
-            merged_data = b"".join(temp_segments)
-
-            # Convert using PyAV
-            output_path = await self._convert_mp4_to_target(
-                merged_data, target_path, audio_track.codec
-            )
-
-            if output_path != target_path:
-                # Conversion failed, return as different codec
-                return TrackDownloadInfo(
-                    download_type=DownloadEnum.TEMP_FILE_PATH,
-                    temp_file_path=output_path,
-                    different_codec=CodecEnum.AAC,
+                # Convert using PyAV from temp file
+                await self._convert_mp4_to_target(
+                    str(temp_mp4_path), target_path, audio_track.codec
                 )
 
             return TrackDownloadInfo(download_type=DownloadEnum.DIRECT)
 
-        return TrackDownloadInfo(download_type=DownloadEnum.URL, file_url=url)
+        return TrackDownloadInfo(download_type=DownloadEnum.URL, file_url=file_url)
 
     async def _convert_mp4_to_target(
-        self, mp4_data: bytes, target_path: str, codec: CodecEnum
-    ) -> str:
+        self, mp4_path: str, target_path: str, codec: CodecEnum
+    ) -> None:
         """Remux audio stream from fMP4 container to target format using PyAV.
 
         Performs stream copy (no re-encoding) for lossless conversion.
         Runs PyAV operations in a thread to avoid blocking the event loop.
 
         Args:
-            mp4_data: Raw MP4 data bytes.
+            mp4_path: Path to the temporary MP4 file.
             target_path: Target output path.
             codec: Target codec.
-
-        Returns:
-            Path to the output file.
         """
         # Map codec to output format
         format_map = {
@@ -1221,32 +1208,19 @@ class ModuleInterface(ModuleBase):
         }
         output_format = format_map.get(codec, "flac")
 
-        try:
-            # Run PyAV operations in a thread to avoid blocking
-            await asyncio.to_thread(
-                self._pyav_remux, mp4_data, target_path, output_format
-            )
-            return target_path
-
-        except Exception as e:
-            # Log the error for debugging
-            print(f"PyAV remux failed: {e}, falling back to m4a")
-            # Fallback: just save as m4a
-            fallback_path = target_path.rsplit(".", 1)[0] + ".m4a"
-            async with aiofiles.open(fallback_path, "wb") as f:
-                await f.write(mp4_data)
-            return fallback_path
+        # Run PyAV operations in a thread to avoid blocking
+        await run_sync(self._pyav_remux, mp4_path, target_path, output_format)
 
     @staticmethod
-    def _pyav_remux(mp4_data: bytes, target_path: str, output_format: str) -> None:
-        """Remux MP4 data to target format using PyAV (blocking).
+    def _pyav_remux(mp4_path: str, target_path: str, output_format: str) -> None:
+        """Remux MP4 file to target format using PyAV (blocking).
 
         Args:
-            mp4_data: Raw MP4 data bytes.
+            mp4_path: Path to the input MP4 file.
             target_path: Target output path.
             output_format: Output format string for PyAV.
         """
-        with av.open(io.BytesIO(mp4_data), mode="r") as input_container:
+        with av.open(mp4_path, mode="r") as input_container:
             input_stream = input_container.streams.audio[0]
 
             with av.open(target_path, mode="w", format=output_format) as out:
