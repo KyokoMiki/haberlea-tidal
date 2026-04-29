@@ -20,6 +20,8 @@ from yarl import URL
 from haberlea.utils.exceptions import ModuleAPIError, ModuleAuthError
 from haberlea.utils.utils import create_aiohttp_session
 
+from .results import DatadomeCookie, DeviceAuthInfo
+
 
 class SessionType(Enum):
     """TIDAL session types for different audio format access."""
@@ -39,13 +41,19 @@ class TidalSession(ABC):
     client_id: str
 
     def __init__(self) -> None:
-        """Initialize session with empty credentials."""
+        """Initialize session with empty credentials.
+
+        The HTTP session is injected later via the ``session`` attribute so
+        that a single ClientSession is shared across all TidalSession
+        instances and the TidalApi. This avoids creating aiohttp sessions in
+        sync __init__ (which can leak and bind to the wrong event loop).
+        """
         self.access_token: str | None = None
         self.refresh_token: str | None = None
         self.expires: datetime | None = None
         self.user_id: str | None = None
         self.country_code: str | None = None
-        self.session: ClientSession = create_aiohttp_session()
+        self.session: ClientSession
 
     def set_storage(self, storage: dict[str, Any]) -> None:
         """Load session data from storage dictionary.
@@ -206,11 +214,11 @@ class TidalMobileSession(TidalSession):
             "Mobile Safari/537.36"
         )
 
-    async def _get_datadome_cookie(self) -> tuple[str, str]:
+    async def _get_datadome_cookie(self) -> DatadomeCookie:
         """Get DataDome cookie for bot protection.
 
         Returns:
-            Tuple of (cookie_name, cookie_value).
+            DatadomeCookie with cookie name and value.
 
         Raises:
             ModuleAuthError: If cookie retrieval fails.
@@ -239,7 +247,8 @@ class TidalMobileSession(TidalSession):
             if not data.get("cookie"):
                 raise ModuleAuthError(module_name="tidal")
             dd_cookie = data["cookie"].split(";")[0]
-            return dd_cookie.split("=", 1)
+            cookie, device_id = dd_cookie.split("=", 1)
+            return DatadomeCookie(cookie=cookie, device_id=device_id)
 
     async def _get_csrf_token(self, params: dict[str, str]) -> str:
         """Get CSRF token from login page.
@@ -414,8 +423,8 @@ class TidalMobileSession(TidalSession):
             ModuleAuthError: If authentication fails.
         """
         # Get DataDome cookie for bot protection
-        cookie_name, cookie_value = await self._get_datadome_cookie()
-        self.session.cookie_jar.update_cookies({cookie_name: cookie_value})
+        dd_cookie = await self._get_datadome_cookie()
+        self.session.cookie_jar.update_cookies({dd_cookie.cookie: dd_cookie.device_id})
 
         # Prepare OAuth parameters
         params: dict[str, str] = {
@@ -478,7 +487,7 @@ class TidalTvSession(TidalSession):
         self.client_id = client_token
         self.client_secret = client_secret
 
-    async def auth(self, username: str = "", password: str = "") -> tuple[str, str]:
+    async def auth(self, username: str = "", password: str = "") -> DeviceAuthInfo:
         """Start device authorization flow.
 
         Args:
@@ -486,7 +495,7 @@ class TidalTvSession(TidalSession):
             password: Unused for TV auth.
 
         Returns:
-            Tuple of (device_code, user_code) for user to complete auth.
+            DeviceAuthInfo with device_code and user_code for user to complete auth.
 
         Raises:
             ModuleAuthError: If authorization request fails.
@@ -498,7 +507,9 @@ class TidalTvSession(TidalSession):
             if response.status != 200:
                 raise ModuleAuthError(module_name="tidal")
             data = msgspec.json.decode(await response.read())
-            return data["deviceCode"], data["userCode"]
+            return DeviceAuthInfo(
+                device_code=data["deviceCode"], user_code=data["userCode"]
+            )
 
     async def check_auth(self, device_code: str) -> bool:
         """Check if device authorization is complete.
@@ -571,12 +582,18 @@ class TidalApi:
     ) -> None:
         """Initialize the API client.
 
+        Owns a single shared aiohttp ClientSession and injects it into every
+        TidalSession instance so that all HTTP traffic funnels through one
+        connector pool and one cookie jar.
+
         Args:
             sessions: Dictionary mapping session type names to TidalSession instances.
         """
         self.sessions = sessions
         self.default: SessionType = SessionType.TV
-        self._session: ClientSession | None = None
+        self.session: ClientSession = create_aiohttp_session()
+        for sess in self.sessions.values():
+            sess.session = self.session
 
     async def _ensure_session(self) -> ClientSession:
         """Ensure aiohttp session exists.
@@ -584,17 +601,16 @@ class TidalApi:
         Returns:
             Active aiohttp ClientSession.
         """
-        if self._session is None or self._session.closed:
-            self._session = create_aiohttp_session()
-        return self._session
+        if self.session.closed:
+            self.session = create_aiohttp_session()
+            for sess in self.sessions.values():
+                sess.session = self.session
+        return self.session
 
     async def close(self) -> None:
-        """Close the aiohttp session."""
-        if self._session and not self._session.closed:
-            await self._session.close()
-        for session in self.sessions.values():
-            if session.session and not session.session.closed:
-                await session.session.close()
+        """Close the shared aiohttp session."""
+        if not self.session.closed:
+            await self.session.close()
 
     def _prepare_request_params(
         self, params: dict[str, Any], current_session: TidalSession
@@ -606,12 +622,13 @@ class TidalApi:
             current_session: Current TIDAL session.
 
         Returns:
-            Updated parameters dictionary.
+            New parameters dictionary with defaults applied.
         """
-        params["countryCode"] = current_session.country_code
-        if "limit" not in params:
-            params["limit"] = "9999"
-        return params
+        return {
+            **params,
+            "countryCode": current_session.country_code,
+            **({} if "limit" in params else {"limit": "9999"}),
+        }
 
     def _check_response_errors(
         self, resp_json: dict[str, Any], url: str
@@ -848,16 +865,18 @@ class TidalApi:
         if result.get("totalNumberOfItems", 0) <= 100:
             return result
 
-        offset = len(result.get("items", []))
+        all_items = list(result.get("items", []))
+        offset = len(all_items)
         while offset < result.get("totalNumberOfItems", 0):
             buf = await self._get(
                 f"playlists/{playlist_id}/items",
                 {"offset": str(offset), "limit": "100"},
             )
-            result["items"].extend(buf.get("items", []))
-            offset += len(buf.get("items", []))
+            new_items = buf.get("items", [])
+            all_items = [*all_items, *new_items]
+            offset += len(new_items)
 
-        return result
+        return {**result, "items": all_items}
 
     async def get_artist(self, artist_id: str) -> dict[str, Any]:
         """Get artist metadata.
