@@ -39,6 +39,8 @@ from haberlea.utils.models import (
     SearchResult,
     TrackDownloadInfo,
     TrackInfo,
+    VideoInfo,
+    VideoQualityEnum,
 )
 from haberlea.utils.progress import advance, get_current_task, reset
 from haberlea.utils.tempfile_manager import TempFileManager
@@ -49,6 +51,10 @@ from .results import AlbumTracksResult
 from .search_adapter import TidalSearchAdapter
 from .stream_resolver import AudioTrack, TidalStreamResolver
 from .tidal_api import SessionType, TidalApi, TidalMobileSession, TidalTvSession
+from .video_resolver import (
+    TidalVideoResolver,
+    quality_to_resolution,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -78,9 +84,9 @@ module_information = ModuleInformation(
         "album": DownloadTypeEnum.album,
         "playlist": DownloadTypeEnum.playlist,
         "artist": DownloadTypeEnum.artist,
+        "video": DownloadTypeEnum.video,
     },
     test_url="https://tidal.com/browse/track/92265335",
-    max_concurrent_downloads=1,
 )
 
 
@@ -121,6 +127,7 @@ class ModuleInterface(ModuleBase):
         self._parser = TidalMetadataParser(self.cover_size)
         self._stream: TidalStreamResolver | None = None
         self._search: TidalSearchAdapter | None = None
+        self._video: TidalVideoResolver | None = None
 
         self._restore_sessions()
 
@@ -132,6 +139,7 @@ class ModuleInterface(ModuleBase):
             self.api, self.sessions, self.quality_parse, self.settings
         )
         self._search = TidalSearchAdapter(self.api, self._parser)
+        self._video = TidalVideoResolver(self.api)
 
     # ------------------------------------------------------------------
     # Session management
@@ -268,7 +276,7 @@ class ModuleInterface(ModuleBase):
         """
         match = re.search(
             r"https?://tidal\.com/(?:browse/)?"
-            r"(?P<media_type>track|album|playlist|artist)/"
+            r"(?P<media_type>track|album|playlist|artist|video)/"
             r"(?P<media_id>[A-Za-z0-9-]+)",
             url,
         )
@@ -280,6 +288,7 @@ class ModuleInterface(ModuleBase):
             "album": DownloadTypeEnum.album,
             "artist": DownloadTypeEnum.artist,
             "playlist": DownloadTypeEnum.playlist,
+            "video": DownloadTypeEnum.video,
         }
         return MediaIdentification(
             media_type=media_types[match.group("media_type")],
@@ -713,6 +722,172 @@ class ModuleInterface(ModuleBase):
                         continue
                     packet.stream = output_stream
                     out.mux(packet)
+
+    # ------------------------------------------------------------------
+    # Music video pipeline
+    # ------------------------------------------------------------------
+
+    async def get_video_info(
+        self,
+        video_id: str,
+        quality_tier: VideoQualityEnum,
+        data: dict[str, Any] | None = None,
+    ) -> VideoInfo:
+        """Get music video metadata and resolved HLS variant.
+
+        Args:
+            video_id: TIDAL video identifier.
+            quality_tier: Desired video quality tier.
+            data: Optional pre-fetched video data.
+
+        Returns:
+            VideoInfo populated with download_data ready for
+            ``get_video_download``.
+        """
+        if not self.api or self._video is None:
+            raise RuntimeError("TIDAL module not logged in")
+
+        video_data = data or await self.api.get_video(video_id)
+
+        master_url = await self._video.fetch_master_url(video_id)
+        master_text = await self._fetch_text(master_url)
+        variants = self._video.parse_master(master_text, master_url)
+        if not variants:
+            raise ValueError(f"Video {video_id}: no variants in master playlist")
+
+        target_resolution = quality_to_resolution(quality_tier)
+        chosen = self._video.pick_variant(variants, target_resolution)
+        resolved_quality = self._video.quality_label(chosen)
+
+        artists_raw = video_data.get("artists") or []
+        artists = [a.get("name", "") for a in artists_raw if a.get("name")]
+
+        cover_id = video_data.get("imageId") or video_data.get("album", {}).get(
+            "cover", ""
+        )
+        cover_url = (
+            self._parser.generate_artwork_url(cover_id, size=self.cover_size)
+            if cover_id
+            else "https://tidal.com/browse/assets/images/defaultImages/defaultVideoImage.png"
+        )
+
+        release_year_raw = video_data.get("releaseDate") or video_data.get(
+            "streamStartDate", ""
+        )
+        release_year = (
+            int(release_year_raw[:4])
+            if release_year_raw and release_year_raw[:4].isdigit()
+            else 0
+        )
+
+        first_artist = artists_raw[0] if artists_raw else {}
+        artist_id = (
+            str(first_artist.get("id")) if first_artist.get("id") is not None else None
+        )
+
+        return VideoInfo(
+            name=video_data.get("title", ""),
+            artists=artists,
+            release_year=release_year,
+            cover_url=cover_url,
+            artist_id=artist_id,
+            duration=video_data.get("duration"),
+            explicit=video_data.get("explicit"),
+            quality=resolved_quality,
+            download_data={
+                "master_url": master_url,
+                "variant_uri": chosen.uri,
+            },
+        )
+
+    async def get_video_download(
+        self,
+        target_path: Path,
+        url: str = "",
+        data: dict | None = None,
+    ) -> TrackDownloadInfo:
+        """Download a music video by fetching HLS segments + remuxing.
+
+        Args:
+            target_path: Final output path (extension chosen by framework).
+            url: Unused (kept for interface compatibility).
+            data: Module payload from ``VideoInfo.download_data``
+                (must contain ``variant_uri``).
+
+        Returns:
+            ``TrackDownloadInfo(download_type=DownloadEnum.DIRECT)``.
+        """
+        if self._video is None:
+            raise RuntimeError("TIDAL module not logged in")
+        if not data or "variant_uri" not in data:
+            raise ValueError("get_video_download: missing variant_uri in data")
+
+        variant_uri = data["variant_uri"]
+        variant_text = await self._fetch_text(variant_uri)
+        segment_urls = self._video.parse_variant_segments(variant_text, variant_uri)
+        if not segment_urls:
+            raise ValueError("Video variant playlist has no segments")
+
+        task_id = get_current_task()
+        if task_id:
+            reset(task_id)
+
+        async with self.temp_manager.file(suffix=".ts") as ts_path:
+            session = create_aiohttp_session()
+            try:
+                async with await open_file(ts_path, "wb") as ts_file:
+                    for segment_url in segment_urls:
+                        async with session.get(segment_url) as response:
+                            response.raise_for_status()
+                            await ts_file.write(await response.read())
+                            if task_id:
+                                await advance(task_id, 1, len(segment_urls))
+            finally:
+                await session.close()
+
+            output_format = (
+                "matroska" if target_path.suffix.lower() == ".mkv" else "mp4"
+            )
+            await run_sync(self._pyav_video_remux, ts_path, target_path, output_format)
+
+        return TrackDownloadInfo(download_type=DownloadEnum.DIRECT)
+
+    @staticmethod
+    def _pyav_video_remux(ts_path: Path, target_path: Path, output_format: str) -> None:
+        """Remux a TS video file to MP4/MKV using PyAV (blocking).
+
+        Copies all input streams (video + audio) to the output container
+        without re-encoding.
+
+        Args:
+            ts_path: Path to the input TS file.
+            target_path: Target output path.
+            output_format: PyAV format name (``"mp4"`` or ``"matroska"``).
+        """
+        with (
+            av.open(str(ts_path), mode="r") as input_container,
+            av.open(str(target_path), mode="w", format=output_format) as out,
+        ):
+            stream_map = {
+                s.index: out.add_stream_from_template(template=s)
+                for s in input_container.streams
+            }
+            for packet in input_container.demux():
+                if packet.dts is None:
+                    continue
+                packet.stream = stream_map[packet.stream.index]
+                out.mux(packet)
+
+    @staticmethod
+    async def _fetch_text(url: str) -> str:
+        """Fetch a text resource (m3u8 playlist) via aiohttp."""
+        session = create_aiohttp_session()
+        try:
+            async with session.get(url) as response:
+                response.raise_for_status()
+                return await response.text()
+        finally:
+            await session.close()
 
     # ------------------------------------------------------------------
     # Cover / Lyrics / Credits

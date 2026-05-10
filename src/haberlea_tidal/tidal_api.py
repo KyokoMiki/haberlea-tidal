@@ -793,6 +793,57 @@ class TidalApi:
         """
         return await self._get(f"tracks/{track_id}")
 
+    async def get_video(self, video_id: str) -> dict[str, Any]:
+        """Get music video metadata.
+
+        Args:
+            video_id: Video identifier.
+
+        Returns:
+            Video metadata dictionary.
+        """
+        return await self._get(f"videos/{video_id}")
+
+    async def get_video_stream_url(
+        self, video_id: str, quality: str = "HIGH"
+    ) -> dict[str, Any]:
+        """Get music video streaming URL (HLS master playlist).
+
+        Args:
+            video_id: Video identifier.
+            quality: Video quality (LOW, MEDIUM, HIGH, AUDIO_ONLY).
+
+        Returns:
+            Stream payload with base64-encoded manifest containing the
+            master m3u8 URL.
+        """
+        return await self._get(
+            f"videos/{video_id}/playbackinfopostpaywall/v4",
+            {
+                "playbackmode": "STREAM",
+                "assetpresentation": "FULL",
+                "videoquality": quality,
+            },
+        )
+
+    async def get_artist_videos(
+        self, artist_id: str, offset: int = 0, limit: int = 50
+    ) -> dict[str, Any]:
+        """Get an artist's music videos.
+
+        Args:
+            artist_id: Artist identifier.
+            offset: Pagination offset.
+            limit: Maximum items per page.
+
+        Returns:
+            Paginated artist videos response.
+        """
+        return await self._get(
+            f"artists/{artist_id}/videos",
+            params={"offset": str(offset), "limit": str(limit)},
+        )
+
     async def get_album(self, album_id: str) -> dict[str, Any]:
         """Get album metadata.
 
