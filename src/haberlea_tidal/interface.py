@@ -13,7 +13,6 @@ from typing import Any
 
 import anyio
 import av
-from anyio import open_file
 from anyio.to_thread import run_sync
 
 from haberlea.plugins.base import ModuleBase
@@ -29,6 +28,7 @@ from haberlea.utils.models import (
     DownloadTypeEnum,
     ImageFileTypeEnum,
     LyricsInfo,
+    ManualEnum,
     MediaIdentification,
     ModuleController,
     ModuleFlags,
@@ -42,9 +42,8 @@ from haberlea.utils.models import (
     VideoInfo,
     VideoQualityEnum,
 )
-from haberlea.utils.progress import advance, get_current_task, reset
 from haberlea.utils.tempfile_manager import TempFileManager
-from haberlea.utils.utils import create_aiohttp_session
+from haberlea.utils.utils import create_aiohttp_session, download_segments
 
 from .metadata_parser import TidalMetadataParser
 from .results import AlbumTracksResult
@@ -86,6 +85,7 @@ module_information = ModuleInformation(
         "artist": DownloadTypeEnum.artist,
         "video": DownloadTypeEnum.video,
     },
+    url_decoding=ManualEnum.manual,
     test_url="https://tidal.com/browse/track/92265335",
 )
 
@@ -122,6 +122,7 @@ class ModuleInterface(ModuleBase):
         self.api: TidalApi | None = None
         self.album_cache: dict[str, dict[str, Any]] = {}
         self.temp_manager = TempFileManager()
+        self._max_concurrency = module_controller.haberlea_options.concurrent_downloads
 
         # Collaborators (initialized after login/restore)
         self._parser = TidalMetadataParser(self.cover_size)
@@ -275,7 +276,7 @@ class ModuleInterface(ModuleBase):
             MediaIdentification or None if invalid.
         """
         match = re.search(
-            r"https?://tidal\.com/(?:browse/)?"
+            r"https?://(?:[a-zA-Z0-9-]+\.)?tidal\.com/(?:browse/)?"
             r"(?P<media_type>track|album|playlist|artist|video)/"
             r"(?P<media_id>[A-Za-z0-9-]+)",
             url,
@@ -655,42 +656,27 @@ class ModuleInterface(ModuleBase):
         audio_track: AudioTrack | None = data.get("audio_track")
 
         if audio_track:
-            total_segments = len(audio_track.urls)
-            task_id = get_current_task()
-            if task_id:
-                reset(task_id)
-
-            async with self.temp_manager.file(suffix=".mp4") as temp_mp4_path:
-                session = create_aiohttp_session()
-                try:
-                    async with await open_file(temp_mp4_path, "wb") as temp_file:
-                        for segment_url in audio_track.urls:
-                            async with session.get(segment_url) as response:
-                                response.raise_for_status()
-                                segment_data = await response.read()
-                                await temp_file.write(segment_data)
-                                if task_id:
-                                    await advance(task_id, 1, total_segments)
-                finally:
-                    await session.close()
-
-                await self._convert_mp4_to_target(
-                    temp_mp4_path,
-                    target_path,
-                    audio_track.codec,
+            async with self.temp_manager.dir() as seg_dir:
+                seg_paths = await download_segments(
+                    audio_track.urls,
+                    seg_dir,
+                    max_concurrency=1,
+                )
+                await self._convert_segments_to_target(
+                    seg_paths, target_path, audio_track.codec
                 )
 
             return TrackDownloadInfo(download_type=DownloadEnum.DIRECT)
 
         return TrackDownloadInfo(download_type=DownloadEnum.URL, file_url=file_url)
 
-    async def _convert_mp4_to_target(
-        self, mp4_path: Path, target_path: Path, codec: CodecEnum
+    async def _convert_segments_to_target(
+        self, seg_paths: list[Path], target_path: Path, codec: CodecEnum
     ) -> None:
-        """Remux audio from fMP4 to target format using PyAV.
+        """Remux fMP4 segments to target format via FFmpeg concat protocol.
 
         Args:
-            mp4_path: Path to the temporary MP4 file.
+            seg_paths: Ordered segment file paths.
             target_path: Target output path.
             codec: Target codec.
         """
@@ -702,25 +688,31 @@ class ModuleInterface(ModuleBase):
             CodecEnum.MHA1: "mha1",
         }
         output_format = format_map.get(codec, "flac")
-        await run_sync(self._pyav_remux, mp4_path, target_path, output_format)
+        await run_sync(self._pyav_audio_remux, seg_paths, target_path, output_format)
 
     @staticmethod
-    def _pyav_remux(mp4_path: Path, target_path: Path, output_format: str) -> None:
-        """Remux MP4 file to target format using PyAV (blocking).
+    def _pyav_audio_remux(
+        seg_paths: list[Path], target_path: Path, output_format: str
+    ) -> None:
+        """Remux fMP4 segments to target format using concat protocol (blocking).
+
+        FFmpeg's concat protocol reads multiple files as one contiguous
+        byte stream at C level, avoiding Python-side binary concatenation.
 
         Args:
-            mp4_path: Path to the input MP4 file.
-            target_path: Target output path.
+            seg_paths: Ordered fMP4 segment file paths.
+            target_path: Final output path.
             output_format: Output format string for PyAV.
         """
-        with av.open(str(mp4_path), mode="r") as input_container:
-            input_stream = input_container.streams.audio[0]
+        concat_url = "concat:" + "|".join(str(p) for p in seg_paths)
+        with av.open(concat_url, mode="r", format="mp4") as inp:
+            in_stream = inp.streams.audio[0]
             with av.open(str(target_path), mode="w", format=output_format) as out:
-                output_stream = out.add_stream_from_template(template=input_stream)
-                for packet in input_container.demux(input_stream):
+                out_stream = out.add_stream_from_template(template=in_stream)
+                for packet in inp.demux(in_stream):
                     if packet.dts is None:
                         continue
-                    packet.stream = output_stream
+                    packet.stream = out_stream
                     out.mux(packet)
 
     # ------------------------------------------------------------------
@@ -828,51 +820,44 @@ class ModuleInterface(ModuleBase):
         if not segment_urls:
             raise ValueError("Video variant playlist has no segments")
 
-        task_id = get_current_task()
-        if task_id:
-            reset(task_id)
-
-        async with self.temp_manager.file(suffix=".ts") as ts_path:
-            session = create_aiohttp_session()
-            try:
-                async with await open_file(ts_path, "wb") as ts_file:
-                    for segment_url in segment_urls:
-                        async with session.get(segment_url) as response:
-                            response.raise_for_status()
-                            await ts_file.write(await response.read())
-                            if task_id:
-                                await advance(task_id, 1, len(segment_urls))
-            finally:
-                await session.close()
-
+        async with self.temp_manager.dir() as seg_dir:
+            seg_paths = await download_segments(
+                segment_urls,
+                seg_dir,
+                max_concurrency=1,
+            )
             output_format = (
                 "matroska" if target_path.suffix.lower() == ".mkv" else "mp4"
             )
-            await run_sync(self._pyav_video_remux, ts_path, target_path, output_format)
+            await run_sync(
+                self._pyav_video_remux, seg_paths, target_path, output_format
+            )
 
         return TrackDownloadInfo(download_type=DownloadEnum.DIRECT)
 
     @staticmethod
-    def _pyav_video_remux(ts_path: Path, target_path: Path, output_format: str) -> None:
-        """Remux a TS video file to MP4/MKV using PyAV (blocking).
+    def _pyav_video_remux(
+        seg_paths: list[Path], target_path: Path, output_format: str
+    ) -> None:
+        """Remux TS segment files to MP4/MKV via FFmpeg concat protocol.
 
-        Copies all input streams (video + audio) to the output container
-        without re-encoding.
+        FFmpeg reads all TS segments as one contiguous MPEG-TS stream
+        at C level, then copies all streams to the output container.
 
         Args:
-            ts_path: Path to the input TS file.
+            seg_paths: Ordered list of TS segment file paths.
             target_path: Target output path.
             output_format: PyAV format name (``"mp4"`` or ``"matroska"``).
         """
+        concat_url = "concat:" + "|".join(str(p) for p in seg_paths)
         with (
-            av.open(str(ts_path), mode="r") as input_container,
+            av.open(concat_url, mode="r", format="mpegts") as inp,
             av.open(str(target_path), mode="w", format=output_format) as out,
         ):
             stream_map = {
-                s.index: out.add_stream_from_template(template=s)
-                for s in input_container.streams
+                s.index: out.add_stream_from_template(template=s) for s in inp.streams
             }
-            for packet in input_container.demux():
+            for packet in inp.demux():
                 if packet.dts is None:
                     continue
                 packet.stream = stream_map[packet.stream.index]
