@@ -215,14 +215,17 @@ class ModuleInterface(ModuleBase):
                 if session_type == SessionType.TV.name:
                     if isinstance(session, TidalTvSession):
                         auth_info = await session.auth()
-                        logger.info(
-                            "Please visit https://link.tidal.com/%s",
-                            auth_info.user_code,
-                        )
-                        logger.info("Waiting for authorization...")
-                        while not await session.check_auth(auth_info.device_code):
-                            await anyio.sleep(2)
-                        logger.info("Authorization successful!")
+                        prompter = self.module_controller.auth_prompter
+                        link = f"https://link.tidal.com/{auth_info.user_code}"
+                        async with prompter.waiting(
+                            "Please open the link below to authorize TIDAL access.",
+                            link,
+                        ):
+                            while not await session.check_auth(
+                                auth_info.device_code
+                            ):
+                                await anyio.sleep(2)
+                        await prompter.notify("Authorization successful!")
                 else:
                     tv_sess = self.sessions.get(SessionType.TV.name)
                     if tv_sess and tv_sess.refresh_token:
