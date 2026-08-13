@@ -6,6 +6,7 @@ supporting multiple session types (TV, Mobile) for different audio formats.
 
 import base64
 import hashlib
+import logging
 import secrets
 from abc import ABC, abstractmethod
 from datetime import UTC, datetime, timedelta
@@ -15,12 +16,25 @@ from urllib.parse import parse_qs, urlparse
 
 import msgspec
 from aiohttp import ClientResponseError, ClientSession
+from tenacity import (
+    before_sleep_log,
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 from yarl import URL
 
-from haberlea.utils.exceptions import ModuleAPIError, ModuleAuthError
+from haberlea.utils.exceptions import (
+    ModuleAPIError,
+    ModuleAuthError,
+    RateLimitError,
+)
 from haberlea.utils.utils import create_aiohttp_session
 
 from .results import DatadomeCookie, DeviceAuthInfo
+
+logger = logging.getLogger(__name__)
 
 
 class SessionType(Enum):
@@ -710,6 +724,13 @@ class TidalApi:
         # Check for errors in response
         return self._check_response_errors(resp_json, url)
 
+    @retry(
+        retry=retry_if_exception_type(RateLimitError),
+        stop=stop_after_attempt(4),
+        wait=wait_exponential(multiplier=1, min=2, max=30),
+        reraise=True,
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+    )
     async def _get(
         self,
         url: str,
@@ -728,6 +749,7 @@ class TidalApi:
 
         Raises:
             ModuleAPIError: If the request fails.
+            RateLimitError: If the API rate limit is exceeded after retries.
         """
         if params is None:
             params = {}
@@ -750,6 +772,12 @@ class TidalApi:
                 headers=current_session.auth_headers,
                 params=params,
             ) as response:
+                if response.status == 429:
+                    retry_after = response.headers.get("Retry-After", "")
+                    raise RateLimitError(
+                        retry_after=int(retry_after) if retry_after.isdigit() else None,
+                        module_name="tidal",
+                    )
                 return await self._handle_api_response(
                     response, url, current_session, params, refresh
                 )
